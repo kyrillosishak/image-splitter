@@ -1,0 +1,105 @@
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      - vllm
+    environment:
+      - VLLM_URL=http://vllm:8000
+    volumes:
+      - ./uploads:/app/uploads
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    ports:
+      - "8001:8000"
+    command: >
+      --model HuggingFaceTB/SmolVLM-Instruct
+      --dtype float16
+      --api-key token-abc123
+      --host 0.0.0.0
+      --port 8000
+      --max-model-len 1024
+      --trust-remote-code
+      --gpu-memory-utilization 0.8
+      --max-num-batched-tokens 2048
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+    profiles:
+      - gpu
+
+  # Even smaller model for low-memory systems
+  vllm-tiny:
+    image: vllm/vllm-openai:latest
+    ports:
+      - "8001:8000"
+    command: >
+      --model HuggingFaceTB/SmolVLM-256M-Instruct
+      --dtype float16
+      --api-key token-abc123
+      --host 0.0.0.0
+      --port 8000
+      --max-model-len 1024
+      --trust-remote-code
+      --gpu-memory-utilization 0.9
+      --max-num-batched-tokens 1024
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+    profiles:
+      - gpu-tiny
+
+  # CPU-only fallback (slower but works without GPU issues)
+  vllm-cpu:
+    image: vllm/vllm-openai:latest
+    ports:
+      - "8001:8000"
+    command: >
+      --model HuggingFaceTB/SmolVLM-500M-Instruct
+      --dtype float16
+      --api-key token-abc123
+      --host 0.0.0.0
+      --port 8000
+      --max-model-len 512
+      --trust-remote-code
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    profiles:
+      - cpu
+
+  # Mock service for testing
+  vllm-mock:
+    build:
+      context: ./mock-vllm
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8000"
+    profiles:
+      - mock
