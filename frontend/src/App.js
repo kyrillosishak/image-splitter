@@ -1,56 +1,75 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useCallback } from 'react';
 import './App.css';
 
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || 'http://localhost:8000';
+
 function App() {
-  const [image, setImage] = useState(null);
-  const [imageFile, setImageFile] = useState(null);
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [imagePreview, setImagePreview] = useState(null);
   const [points, setPoints] = useState([]);
   const [question, setQuestion] = useState('');
-  const [response, setResponse] = useState('');
-  const [splitImages, setSplitImages] = useState({ image1: null, image2: null });
+  const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [vllmReady, setVllmReady] = useState(false);
+  const [error, setError] = useState('');
+  const [splitImages, setSplitImages] = useState({ image1: null, image2: null });
+
   const canvasRef = useRef(null);
   const imageRef = useRef(null);
 
-  const handleImageUpload = (event) => {
+  const handleFileChange = (event) => {
     const file = event.target.files[0];
     if (file) {
-      setImageFile(file);
+      setSelectedFile(file);
+      setPoints([]);
+      setResult(null);
+      setError('');
+      setSplitImages({ image1: null, image2: null });
+
+      // Create preview
       const reader = new FileReader();
       reader.onload = (e) => {
-        setImage(e.target.result);
-        setPoints([]);
-        setResponse('');
-        setSplitImages({ image1: null, image2: null });
+        setImagePreview(e.target.result);
       };
       reader.readAsDataURL(file);
     }
   };
 
-  const handleCanvasClick = (event) => {
-    if (points.length >= 2) return;
-
+  const getImageCoordinates = useCallback((event) => {
     const canvas = canvasRef.current;
     const rect = canvas.getBoundingClientRect();
-    const x = event.clientX - rect.left;
-    const y = event.clientY - rect.top;
-
-    // Scale coordinates to match actual image size
     const scaleX = canvas.width / rect.width;
     const scaleY = canvas.height / rect.height;
-    const actualX = Math.round(x * scaleX);
-    const actualY = Math.round(y * scaleY);
 
-    setPoints([...points, { x: actualX, y: actualY }]);
+    const x = (event.clientX - rect.left) * scaleX;
+    const y = (event.clientY - rect.top) * scaleY;
+
+    // Convert to relative coordinates (0-1)
+    const relativeX = x / canvas.width;
+    const relativeY = y / canvas.height;
+
+    return { x: relativeX, y: relativeY, pixelX: x, pixelY: y };
+  }, []);
+
+  const handleCanvasClick = (event) => {
+    if (points.length >= 2) {
+      setPoints([]);
+      redrawCanvas();
+    }
+
+    const coords = getImageCoordinates(event);
+    const newPoints = [...points, coords];
+    setPoints(newPoints);
+
+    // Redraw canvas with points
+    redrawCanvas(newPoints);
   };
 
-  const drawImageAndPoints = () => {
+  const redrawCanvas = (currentPoints = points) => {
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
     const img = imageRef.current;
 
-    if (!img || !canvas) return;
+    if (!img) return;
 
     // Clear canvas
     ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -59,34 +78,55 @@ function App() {
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
     // Draw points
-    ctx.fillStyle = 'red';
-    ctx.strokeStyle = 'red';
-    ctx.lineWidth = 2;
-
-    points.forEach((point, index) => {
-      const x = (point.x / img.naturalWidth) * canvas.width;
-      const y = (point.y / img.naturalHeight) * canvas.height;
-
-      // Draw point
+    currentPoints.forEach((point, index) => {
       ctx.beginPath();
-      ctx.arc(x, y, 5, 0, 2 * Math.PI);
+      ctx.arc(point.pixelX, point.pixelY, 8, 0, 2 * Math.PI);
+      ctx.fillStyle = index === 0 ? '#ff0000' : '#00ff00';
       ctx.fill();
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2;
+      ctx.stroke();
 
-      // Draw point label
-      ctx.fillText(`${index + 1}`, x + 10, y - 10);
+      // Add point label
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '14px Arial';
+      ctx.fillText(`P${index + 1}`, point.pixelX + 12, point.pixelY - 8);
     });
 
     // Draw line between points
-    if (points.length === 2) {
-      const x1 = (points[0].x / img.naturalWidth) * canvas.width;
-      const y1 = (points[0].y / img.naturalHeight) * canvas.height;
-      const x2 = (points[1].x / img.naturalWidth) * canvas.width;
-      const y2 = (points[1].y / img.naturalHeight) * canvas.height;
-
+    if (currentPoints.length === 2) {
       ctx.beginPath();
-      ctx.moveTo(x1, y1);
-      ctx.lineTo(x2, y2);
+      ctx.moveTo(currentPoints[0].pixelX, currentPoints[0].pixelY);
+      ctx.lineTo(currentPoints[1].pixelX, currentPoints[1].pixelY);
+      ctx.strokeStyle = '#ffff00';
+      ctx.lineWidth = 3;
       ctx.stroke();
+
+      // Draw line extension to show split
+      const p1 = currentPoints[0];
+      const p2 = currentPoints[1];
+
+      // Calculate line direction
+      const dx = p2.pixelX - p1.pixelX;
+      const dy = p2.pixelY - p1.pixelY;
+      const length = Math.sqrt(dx * dx + dy * dy);
+
+      if (length > 0) {
+        const unitX = dx / length;
+        const unitY = dy / length;
+
+        // Extend line to canvas edges
+        const extendLength = Math.max(canvas.width, canvas.height);
+
+        ctx.beginPath();
+        ctx.moveTo(p1.pixelX - unitX * extendLength, p1.pixelY - unitY * extendLength);
+        ctx.lineTo(p1.pixelX + unitX * extendLength, p1.pixelY + unitY * extendLength);
+        ctx.strokeStyle = '#ffff00';
+        ctx.lineWidth = 2;
+        ctx.globalAlpha = 0.7;
+        ctx.stroke();
+        ctx.globalAlpha = 1.0;
+      }
     }
   };
 
@@ -94,150 +134,183 @@ function App() {
     const canvas = canvasRef.current;
     const img = imageRef.current;
 
-    if (img && canvas) {
-      // Set canvas size to match image aspect ratio
-      const maxWidth = 600;
-      const maxHeight = 400;
+    if (!img || !canvas) return;
 
-      let { width, height } = img;
+    // Set canvas size to match image display size
+    const maxWidth = 800;
+    const maxHeight = 600;
 
-      if (width > maxWidth) {
-        height = (height * maxWidth) / width;
-        width = maxWidth;
-      }
+    let { width, height } = img;
 
-      if (height > maxHeight) {
-        width = (width * maxHeight) / height;
-        height = maxHeight;
-      }
-
-      canvas.width = width;
-      canvas.height = height;
-
-      drawImageAndPoints();
+    // Scale to fit container
+    if (width > maxWidth || height > maxHeight) {
+      const scale = Math.min(maxWidth / width, maxHeight / height);
+      width = width * scale;
+      height = height * scale;
     }
+
+    canvas.width = width;
+    canvas.height = height;
+
+    // Initial draw
+    redrawCanvas();
   };
 
-  React.useEffect(() => {
-    if (image) {
-      drawImageAndPoints();
-    }
-  }, [points, image]);
-
-  const handleAnalyze = async () => {
-    if (!imageFile || points.length !== 2 || !question.trim()) {
-      alert('Please upload an image, select two points, and enter a question.');
+  const handleSubmit = async () => {
+    if (!selectedFile || points.length !== 2 || !question.trim()) {
+      setError('Please select an image, place 2 points, and enter a question.');
       return;
     }
 
     setLoading(true);
-    setResponse('');
+    setError('');
+    setResult(null);
 
     try {
-      const formData = new FormData();
-      formData.append('image', imageFile);
-      formData.append('point1_x', points[0].x);
-      formData.append('point1_y', points[0].y);
-      formData.append('point2_x', points[1].x);
-      formData.append('point2_y', points[1].y);
-      formData.append('question', question);
+      // Convert file to base64
+      const base64 = await fileToBase64(selectedFile);
 
-      const response = await fetch('/analyze', {
+      const payload = {
+        image_base64: base64.split(',')[1], // Remove data:image/...;base64, prefix
+        point1: { x: points[0].x, y: points[0].y },
+        point2: { x: points[1].x, y: points[1].y },
+        question: question
+      };
+
+      const response = await fetch(`${BACKEND_URL}/api/split-image`, {
         method: 'POST',
-        body: formData,
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
       });
 
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
 
-      const result = await response.json();
-      setResponse(result.response);
-      setSplitImages({
-        image1: result.image1,
-        image2: result.image2
-      });
-      setVllmReady(result.vllm_ready);
+      const data = await response.json();
 
-    } catch (error) {
-      console.error('Error:', error);
-      setResponse(`Error: ${error.message}`);
+      if (data.success) {
+        setResult(data.answer);
+        setSplitImages({
+          image1: data.image1_base64,
+          image2: data.image2_base64
+        });
+      } else {
+        setError(data.error || 'Failed to process image');
+      }
+
+    } catch (err) {
+      setError(`Error: ${err.message}`);
     } finally {
       setLoading(false);
     }
   };
 
-  const clearPoints = () => {
+  const fileToBase64 = (file) => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = error => reject(error);
+    });
+  };
+
+  const resetAll = () => {
+    setSelectedFile(null);
+    setImagePreview(null);
     setPoints([]);
-    setResponse('');
+    setQuestion('');
+    setResult(null);
+    setError('');
     setSplitImages({ image1: null, image2: null });
   };
 
   return (
     <div className="App">
-      <header className="App-header">
-        <h1>Image Split Analyzer</h1>
-        <p>Upload an image, select two points to split it, and ask a question about the relationship between the parts.</p>
-      </header>
+      <div className="container">
+        <h1>Image Splitter & Multimodal Analysis</h1>
 
-      <main className="App-main">
         <div className="upload-section">
           <input
             type="file"
             accept="image/*"
-            onChange={handleImageUpload}
+            onChange={handleFileChange}
+            id="file-input"
             className="file-input"
           />
+          <label htmlFor="file-input" className="file-label">
+            Choose Image
+          </label>
+          {selectedFile && (
+            <span className="file-name">{selectedFile.name}</span>
+          )}
         </div>
 
-        {image && (
+        {imagePreview && (
           <div className="image-section">
-            <h3>Click two points on the image to define the split line:</h3>
-            <div className="canvas-container">
-              <canvas
-                ref={canvasRef}
-                onClick={handleCanvasClick}
-                style={{ border: '1px solid #ccc', cursor: 'crosshair' }}
-              />
+            <h3>Click two points to define the split line:</h3>
+            <div className="image-container">
               <img
                 ref={imageRef}
-                src={image}
-                alt="Uploaded"
+                src={imagePreview}
+                alt="Preview"
                 style={{ display: 'none' }}
                 onLoad={handleImageLoad}
               />
+              <canvas
+                ref={canvasRef}
+                onClick={handleCanvasClick}
+                className="image-canvas"
+              />
             </div>
-            <p>Points selected: {points.length}/2</p>
-            <button onClick={clearPoints} className="clear-button">Clear Points</button>
+            <div className="points-info">
+              <p>Points selected: {points.length}/2</p>
+              {points.length > 0 && (
+                <div className="point-details">
+                  {points.map((point, index) => (
+                    <span key={index} className="point-detail">
+                      P{index + 1}: ({Math.round(point.x * 100)}%, {Math.round(point.y * 100)}%)
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         )}
 
         {points.length === 2 && (
           <div className="question-section">
-            <h3>Ask a question about the relationship between the two parts:</h3>
+            <h3>Ask a question about the relationship between the two image parts:</h3>
             <textarea
               value={question}
               onChange={(e) => setQuestion(e.target.value)}
-              placeholder="e.g., What is the difference between the left and right parts?"
+              placeholder="e.g., What is the difference between the left and right parts of the image?"
               className="question-input"
             />
             <button
-              onClick={handleAnalyze}
-              disabled={loading}
-              className="analyze-button"
+              onClick={handleSubmit}
+              disabled={loading || !question.trim()}
+              className="submit-button"
             >
-              {loading ? 'Analyzing...' : 'Analyze'}
+              {loading ? 'Analyzing...' : 'Analyze Images'}
             </button>
-            <div className="status">
-              vLLM Status: {vllmReady ? '✅ Ready' : '⚠️ Starting up (using mock responses)'}
-            </div>
           </div>
         )}
 
-        {response && (
-          <div className="response-section">
+        {error && (
+          <div className="error-message">
+            {error}
+          </div>
+        )}
+
+        {result && (
+          <div className="result-section">
             <h3>Analysis Result:</h3>
-            <div className="response-text">{response}</div>
+            <div className="result-content">
+              <p>{result}</p>
+            </div>
           </div>
         )}
 
@@ -246,23 +319,31 @@ function App() {
             <h3>Split Images:</h3>
             <div className="split-images-container">
               <div className="split-image">
-                <h4>Part 1</h4>
+                <h4>Image Part 1</h4>
                 <img
                   src={`data:image/png;base64,${splitImages.image1}`}
                   alt="Split part 1"
+                  className="split-image-display"
                 />
               </div>
               <div className="split-image">
-                <h4>Part 2</h4>
+                <h4>Image Part 2</h4>
                 <img
                   src={`data:image/png;base64,${splitImages.image2}`}
                   alt="Split part 2"
+                  className="split-image-display"
                 />
               </div>
             </div>
           </div>
         )}
-      </main>
+
+        <div className="controls">
+          <button onClick={resetAll} className="reset-button">
+            Reset All
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

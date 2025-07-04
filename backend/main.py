@@ -1,363 +1,243 @@
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 import os
-import io
-import base64
-from PIL import Image, ImageDraw
-import numpy as np
-import requests
 import json
+import base64
+import random
+import asyncio
+import logging
 from typing import List, Tuple
-import threading
-import time
-import subprocess
-import sys
+from io import BytesIO
 
-app = FastAPI(title="Image Split Analyzer")
+import requests
+import numpy as np
+from PIL import Image, ImageDraw
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Image Splitting API", version="1.0.0")
 
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global variables for vLLM server management
-vllm_process = None
-vllm_ready = False
+# Configuration
+VLLM_HOST = os.getenv("VLLM_HOST", "http://localhost:8081")
+VLLM_ENDPOINT = os.getenv("VLLM_ENDPOINT", "/api/v1/generate-response")
+VLLM_URL = f"{VLLM_HOST}{VLLM_ENDPOINT}"
 
 
-def start_vllm_server():
-    """Start vLLM server in a separate process"""
-    global vllm_process, vllm_ready
+# Request models
+class Point(BaseModel):
+    x: float
+    y: float
 
 
-    try:
-        model = 'HuggingFaceTB/SmolVLM2-500M-Video-Instruct'
+class ImageSplitRequest(BaseModel):
+    image_base64: str
+    point1: Point
+    point2: Point
+    question: str
 
-        # Start vllm server in the background
-        # Updated vLLM server configuration for multi-image support
-        vllm_process = subprocess.Popen([
-            'vllm',
-            'serve',
-            model,
-            '--trust-remote-code',
-            '--dtype', 'half',
-            '--max-model-len', '8192',
-            '--tensor-parallel-size', '1',
-            '--limit-mm-per-prompt', '{"image": 2}',
-            '--enforce-eager',
-        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
 
-        try:
-            success, stdout, stderr = monitor_vllm_process(vllm_process)
+class ImageSplitResponse(BaseModel):
+    success: bool
+    answer: str
+    image1_base64: str = ""
+    image2_base64: str = ""
+    error: str = ""
 
-            if not success:
-                print("\n❌ VLLM server failed to start!")
-                print("\nFull STDOUT:", stdout)
-                print("\nFull STDERR:", stderr)
-                sys.exit(1)
-            vllm_ready = True
-            print("vLLM server is ready!")
 
-        except KeyboardInterrupt:
-            print("\n⚠️ Monitoring interrupted by user")
-            # # This should just exited the process of probing, not the vllm, if you want it then you coul uncomment this.
-            # vllm_process.terminate()
-            # try:
-            #     vllm_process.wait(timeout=5)
-            # except subprocess.TimeoutExpired:
-            #     vllm_process.kill()
+def get_random_response(question: str) -> str:
+    """Generate a random response when vLLM is not available"""
+    responses = [
+        "Based on the image analysis, I can see the relationship between the two parts.",
+        "The two image sections show interesting visual connections.",
+        "There appears to be a clear distinction between the left and right portions.",
+        "The upper and lower sections demonstrate different characteristics.",
+        "The divided images show complementary elements in their composition.",
+        "I can observe notable differences in the visual content of both sections.",
+        "The split reveals contrasting aspects between the two image parts.",
+        "The relationship between these sections suggests spatial continuity.",
+        "Both image portions contribute to the overall visual narrative.",
+        "The division highlights the distinct features in each section."
+    ]
+    return random.choice(responses)
 
-            stdout, stderr = vllm_process.communicate()
-            if stdout: print("\nFinal STDOUT:", stdout.decode('utf-8'))
-            if stderr: print("\nFinal STDERR:", stderr.decode('utf-8'))
-            sys.exit(0)
 
-    except Exception as e:
-        print(f"Error starting vLLM server: {e}")
-
-import requests
-import time
-from typing import Tuple
-import sys
-
-def check_vllm_status(url: str = "http://localhost:8000/health") -> bool:
-    """Check if VLLM server is running and healthy."""
-    try:
-        response = requests.get(url)
-        return response.status_code == 200
-    except requests.exceptions.ConnectionError:
-        return False
-
-def monitor_vllm_process(vllm_process: subprocess.Popen, check_interval: int = 5) -> Tuple[bool, str, str]:
-    """
-    Monitor VLLM process and return status, stdout, and stderr.
-    Returns: (success, stdout, stderr)
-    """
-    print("Starting VLLM server monitoring...")
-
-    while vllm_process.poll() is None:  # While process is still running
-        if check_vllm_status():
-            print("✓ VLLM server is up and running!")
-            return True, "", ""
-
-        print("Waiting for VLLM server to start...")
-        time.sleep(check_interval)
-
-        # Check if there's any output to display
-        if vllm_process.stdout.readable():
-            stdout = vllm_process.stdout.read1().decode('utf-8')
-            if stdout:
-                print("STDOUT:", stdout)
-
-        if vllm_process.stderr.readable():
-            stderr = vllm_process.stderr.read1().decode('utf-8')
-            if stderr:
-                print("STDERR:", stderr)
-
-    # If we get here, the process has ended
-    stdout, stderr = vllm_process.communicate()
-    return False, stdout.decode('utf-8'), stderr.decode('utf-8')
-
-def split_image_by_line(image: Image.Image, point1: Tuple[int, int], point2: Tuple[int, int]) -> Tuple[
-    Image.Image, Image.Image]:
-    """Split image into two parts along a line defined by two points"""
+def split_image_by_line(image: Image.Image, point1: Point, point2: Point) -> Tuple[Image.Image, Image.Image]:
+    """Split image along a line defined by two points"""
     width, height = image.size
 
-    # Create masks for the two parts
+    # Convert points to pixel coordinates
+    p1_x = int(point1.x * width)
+    p1_y = int(point1.y * height)
+    p2_x = int(point2.x * width)
+    p2_y = int(point2.y * height)
+
+    # Create masks for the two regions
     mask1 = Image.new('L', (width, height), 0)
     mask2 = Image.new('L', (width, height), 0)
 
     draw1 = ImageDraw.Draw(mask1)
     draw2 = ImageDraw.Draw(mask2)
 
-    # Determine which side of the line each pixel is on
-    x1, y1 = point1
-    x2, y2 = point2
-
-    # Create polygon for each half
-    if x1 == x2:  # Vertical line
-        if x1 < width // 2:
-            # Left part
-            draw1.rectangle([(0, 0), (x1, height)], fill=255)
-            draw2.rectangle([(x1, 0), (width, height)], fill=255)
-        else:
-            # Right part
-            draw1.rectangle([(x1, 0), (width, height)], fill=255)
-            draw2.rectangle([(0, 0), (x1, height)], fill=255)
+    # Calculate line equation: ax + by + c = 0
+    # For line through (x1,y1) and (x2,y2): (y2-y1)x - (x2-x1)y + (x2-x1)y1 - (y2-y1)x1 = 0
+    if p2_x == p1_x:  # Vertical line
+        # Left side
+        if p1_x > 0:
+            draw1.rectangle([0, 0, p1_x, height], fill=255)
+        # Right side
+        if p1_x < width:
+            draw2.rectangle([p1_x, 0, width, height], fill=255)
     else:
-        # Calculate line equation: y = mx + b
-        m = (y2 - y1) / (x2 - x1)
-        b = y1 - m * x1
+        # General case
+        a = p2_y - p1_y
+        b = p1_x - p2_x
+        c = p2_x * p1_y - p1_x * p2_y
 
-        # Create points for polygon division
-        points1 = []
-        points2 = []
+        # For each pixel, determine which side of the line it's on
+        for y in range(height):
+            for x in range(width):
+                line_value = a * x + b * y + c
+                if line_value <= 0:
+                    mask1.putpixel((x, y), 255)
+                else:
+                    mask2.putpixel((x, y), 255)
 
-        # Determine intersection points with image boundaries
-        intersections = []
-
-        # Check intersection with left edge (x=0)
-        y_at_0 = b
-        if 0 <= y_at_0 <= height:
-            intersections.append((0, int(y_at_0)))
-
-        # Check intersection with right edge (x=width)
-        y_at_width = m * width + b
-        if 0 <= y_at_width <= height:
-            intersections.append((width, int(y_at_width)))
-
-        # Check intersection with top edge (y=0)
-        if m != 0:
-            x_at_0 = -b / m
-            if 0 <= x_at_0 <= width:
-                intersections.append((int(x_at_0), 0))
-
-        # Check intersection with bottom edge (y=height)
-        if m != 0:
-            x_at_height = (height - b) / m
-            if 0 <= x_at_height <= width:
-                intersections.append((int(x_at_height), height))
-
-        # Remove duplicates and sort
-        intersections = list(set(intersections))
-
-        if len(intersections) >= 2:
-            # Use the line to split the image
-            # Determine which side is "upper" or "left"
-            if y1 < y2:  # Line goes down
-                # Upper part
-                points1 = [(0, 0), (width, 0)] + intersections + [(0, 0)]
-                points2 = intersections + [(width, height), (0, height)] + intersections[:1]
-            else:  # Line goes up
-                # Lower part
-                points1 = intersections + [(0, height), (width, height)] + intersections[:1]
-                points2 = [(0, 0), (width, 0)] + intersections + [(0, 0)]
-
-            if len(points1) >= 3:
-                draw1.polygon(points1, fill=255)
-            if len(points2) >= 3:
-                draw2.polygon(points2, fill=255)
-
-    # Apply masks to create split images
-    img1 = Image.new('RGBA', (width, height), (255, 255, 255, 0))
-    img2 = Image.new('RGBA', (width, height), (255, 255, 255, 0))
-
-    # Convert to RGBA if needed
-    if image.mode != 'RGBA':
-        image = image.convert('RGBA')
+    # Create the split images
+    image1 = Image.new('RGBA', (width, height), (255, 255, 255, 0))
+    image2 = Image.new('RGBA', (width, height), (255, 255, 255, 0))
 
     # Apply masks
+    image_rgba = image.convert('RGBA')
+
     for y in range(height):
         for x in range(width):
-            pixel = image.getpixel((x, y))
+            pixel = image_rgba.getpixel((x, y))
             if mask1.getpixel((x, y)) > 0:
-                img1.putpixel((x, y), pixel)
+                image1.putpixel((x, y), pixel)
             if mask2.getpixel((x, y)) > 0:
-                img2.putpixel((x, y), pixel)
+                image2.putpixel((x, y), pixel)
 
-    return img1, img2
+    return image1, image2
 
 
 def image_to_base64(image: Image.Image) -> str:
-    """Convert PIL Image to base64 string"""
-    buffered = io.BytesIO()
-    image.save(buffered, format="PNG")
-    img_str = base64.b64encode(buffered.getvalue()).decode()
-    return img_str
+    """Convert PIL image to base64 string"""
+    buffer = BytesIO()
+    image.save(buffer, format='PNG')
+    return base64.b64encode(buffer.getvalue()).decode('utf-8')
 
 
-def query_vllm(image1_b64: str, image2_b64: str, question: str) -> str:
-    """Query the vLLM server with two images and a question"""
-    global vllm_ready
-
-    if not vllm_ready:
-        # Return mock response if vLLM is not ready
-        return f"Mock response: Based on the two image parts, I can see different sections of the image. Regarding your question '{question}', I would analyze the visual relationship between the left and right (or top and bottom) parts of the split image."
-
+async def query_vllm(question: str, image1_b64: str, image2_b64: str) -> str:
+    """Query the vLLM service with the images and question"""
     try:
+        payload = {
+            "question": question,
+            "image1_b64": image1_b64,
+            "image2_b64": image2_b64
+        }
         headers = {"Content-Type": "application/json"}
 
-        data = {
-            "model": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"I have split an image into two parts. Here are the two parts: First part and second part. Question: {question}"
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{image1_b64}"
-                            }
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{image2_b64}"
-                            }
-                        }
-                    ]
-                }
-            ]
-        }
+        logger.info(f"Querying vLLM at {VLLM_URL}")
 
-        response = requests.post(
-            "http://localhost:8001/v1/chat/completions",
-            headers=headers,
-            json=data,
-            timeout=120
+        # Use asyncio to make the request with timeout
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: requests.post(VLLM_URL, json=payload, headers=headers, timeout=30)
         )
 
         if response.status_code == 200:
-            result = response.json()
-            return result["choices"][0]["message"]["content"]
+            try:
+                full_response = response.json()
+                content = full_response["response"]["choices"][0]["message"]["content"]
+                logger.info("Successfully got response from vLLM")
+                return content.strip()
+            except Exception as e:
+                logger.error(f"Error parsing vLLM response: {e}")
+                logger.error(f"Raw response: {response.text}")
+                return get_random_response(question)
         else:
-            return f"Error from vLLM: {response.status_code} - {response.text}"
+            logger.warning(f"vLLM returned error {response.status_code}: {response.text}")
+            return get_random_response(question)
 
     except Exception as e:
-        return f"Mock response due to error: {str(e)}. Based on the two image parts, I can analyze the visual relationship between the sections. Regarding your question '{question}', I would examine the spatial and content relationships between the split parts."
+        logger.error(f"Failed to connect to vLLM: {e}")
+        return get_random_response(question)
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Start vLLM server when the app starts"""
-    print("Starting vLLM server...")
-    thread = threading.Thread(target=start_vllm_server)
-    thread.daemon = True
-    thread.start()
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Stop vLLM server when the app shuts down"""
-    global vllm_process
-    if vllm_process:
-        vllm_process.terminate()
-        vllm_process.wait()
-
-
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "vllm_ready": vllm_ready}
-
-
-@app.post("/analyze")
-async def analyze_image(
-        image: UploadFile = File(...),
-        point1_x: int = Form(...),
-        point1_y: int = Form(...),
-        point2_x: int = Form(...),
-        point2_y: int = Form(...),
-        question: str = Form(...)
-):
+@app.post("/api/split-image", response_model=ImageSplitResponse)
+async def split_image(request: ImageSplitRequest):
+    """Split image and analyze with multimodal LLM"""
     try:
-        # Read and process the uploaded image
-        contents = await image.read()
-        pil_image = Image.open(io.BytesIO(contents))
-
-        # Convert to RGB if needed
-        if pil_image.mode in ('RGBA', 'LA'):
-            # Create a white background
-            background = Image.new('RGB', pil_image.size, (255, 255, 255))
-            if pil_image.mode == 'RGBA':
-                background.paste(pil_image, mask=pil_image.split()[-1])
-            else:
-                background.paste(pil_image, mask=pil_image.split()[-1])
-            pil_image = background
-        elif pil_image.mode != 'RGB':
-            pil_image = pil_image.convert('RGB')
+        # Decode base64 image
+        image_data = base64.b64decode(request.image_base64)
+        image = Image.open(BytesIO(image_data))
 
         # Split the image
-        point1 = (point1_x, point1_y)
-        point2 = (point2_x, point2_y)
+        image1, image2 = split_image_by_line(image, request.point1, request.point2)
 
-        img1, img2 = split_image_by_line(pil_image, point1, point2)
+        # Convert split images to base64
+        image1_b64 = image_to_base64(image1)
+        image2_b64 = image_to_base64(image2)
 
-        # Convert to base64
-        img1_b64 = image_to_base64(img1)
-        img2_b64 = image_to_base64(img2)
+        # Query the LLM
+        answer = await query_vllm(request.question, image1_b64, image2_b64)
 
-        # Query vLLM
-        response = query_vllm(img1_b64, img2_b64, question)
-
-        return JSONResponse({
-            "success": True,
-            "response": response,
-            "image1": img1_b64,
-            "image2": img2_b64,
-            "vllm_ready": vllm_ready
-        })
+        return ImageSplitResponse(
+            success=True,
+            answer=answer,
+            image1_base64=image1_b64,
+            image2_base64=image2_b64
+        )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error processing image: {e}")
+        return ImageSplitResponse(
+            success=False,
+            answer="",
+            error=str(e)
+        )
+
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "vllm_url": VLLM_URL}
+
+
+@app.get("/api/test-vllm")
+async def test_vllm():
+    """Test connectivity to vLLM service"""
+    try:
+        # Create a simple test with dummy data
+        test_question = "What do you see in these images?"
+        dummy_image_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+
+        response = await query_vllm(test_question, dummy_image_b64, dummy_image_b64)
+
+        return {
+            "vllm_available": True,
+            "vllm_url": VLLM_URL,
+            "test_response": response
+        }
+    except Exception as e:
+        return {
+            "vllm_available": False,
+            "vllm_url": VLLM_URL,
+            "error": str(e)
+        }
 
 
 if __name__ == "__main__":

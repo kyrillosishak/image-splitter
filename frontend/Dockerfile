@@ -11,10 +11,10 @@ RUN npm install
 # Copy source code
 COPY . .
 
-# Build the app
+# Build the application
 RUN npm run build
 
-# Install serve to run the built app
+# Install serve to serve the built application
 RUN npm install -g serve
 
 # Expose port
