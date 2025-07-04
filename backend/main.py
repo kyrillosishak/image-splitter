@@ -34,45 +34,94 @@ def start_vllm_server():
     """Start vLLM server in a separate process"""
     global vllm_process, vllm_ready
 
-    model_name = os.getenv("MODEL_NAME", "HuggingFaceTB/SmolVLM2-1.7B-Instruct")
 
     try:
-        # Start vLLM server
-        cmd = [
-            "python", "-m", "vllm.entrypoints.openai.api_server",
-            "--model", model_name,
-            "--port", "8001",
-            "--host", "0.0.0.0",
-            "--quantization", "awq",
-            "--dtype", "auto",
-            "--api-key", "token-abc123"
-        ]
+        model = 'HuggingFaceTB/SmolVLM2-500M-Video-Instruct'
 
-        vllm_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
+        # Start vllm server in the background
+        # Updated vLLM server configuration for multi-image support
+        vllm_process = subprocess.Popen([
+            'vllm',
+            'serve',
+            model,
+            '--trust-remote-code',
+            '--dtype', 'half',
+            '--max-model-len', '8192',
+            '--tensor-parallel-size', '1',
+            '--limit-mm-per-prompt', '{"image": 2}',
+            '--enforce-eager',
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
 
-        # Wait for server to be ready
-        for _ in range(60):  # Wait up to 60 seconds
-            try:
-                response = requests.get("http://localhost:8001/health", timeout=2)
-                if response.status_code == 200:
-                    vllm_ready = True
-                    print("vLLM server is ready!")
-                    break
-            except requests.RequestException:
-                pass
-            time.sleep(1)
+        try:
+            success, stdout, stderr = monitor_vllm_process(vllm_process)
 
-        if not vllm_ready:
-            print("vLLM server failed to start within timeout")
+            if not success:
+                print("\n❌ VLLM server failed to start!")
+                print("\nFull STDOUT:", stdout)
+                print("\nFull STDERR:", stderr)
+                sys.exit(1)
+            vllm_ready = True
+            print("vLLM server is ready!")
+
+        except KeyboardInterrupt:
+            print("\n⚠️ Monitoring interrupted by user")
+            # # This should just exited the process of probing, not the vllm, if you want it then you coul uncomment this.
+            # vllm_process.terminate()
+            # try:
+            #     vllm_process.wait(timeout=5)
+            # except subprocess.TimeoutExpired:
+            #     vllm_process.kill()
+
+            stdout, stderr = vllm_process.communicate()
+            if stdout: print("\nFinal STDOUT:", stdout.decode('utf-8'))
+            if stderr: print("\nFinal STDERR:", stderr.decode('utf-8'))
+            sys.exit(0)
 
     except Exception as e:
         print(f"Error starting vLLM server: {e}")
 
+import requests
+import time
+from typing import Tuple
+import sys
+
+def check_vllm_status(url: str = "http://localhost:8000/health") -> bool:
+    """Check if VLLM server is running and healthy."""
+    try:
+        response = requests.get(url)
+        return response.status_code == 200
+    except requests.exceptions.ConnectionError:
+        return False
+
+def monitor_vllm_process(vllm_process: subprocess.Popen, check_interval: int = 5) -> Tuple[bool, str, str]:
+    """
+    Monitor VLLM process and return status, stdout, and stderr.
+    Returns: (success, stdout, stderr)
+    """
+    print("Starting VLLM server monitoring...")
+
+    while vllm_process.poll() is None:  # While process is still running
+        if check_vllm_status():
+            print("✓ VLLM server is up and running!")
+            return True, "", ""
+
+        print("Waiting for VLLM server to start...")
+        time.sleep(check_interval)
+
+        # Check if there's any output to display
+        if vllm_process.stdout.readable():
+            stdout = vllm_process.stdout.read1().decode('utf-8')
+            if stdout:
+                print("STDOUT:", stdout)
+
+        if vllm_process.stderr.readable():
+            stderr = vllm_process.stderr.read1().decode('utf-8')
+            if stderr:
+                print("STDERR:", stderr)
+
+    # If we get here, the process has ended
+    stdout, stderr = vllm_process.communicate()
+    return False, stdout.decode('utf-8'), stderr.decode('utf-8')
 
 def split_image_by_line(image: Image.Image, point1: Tuple[int, int], point2: Tuple[int, int]) -> Tuple[
     Image.Image, Image.Image]:
@@ -191,14 +240,10 @@ def query_vllm(image1_b64: str, image2_b64: str, question: str) -> str:
         return f"Mock response: Based on the two image parts, I can see different sections of the image. Regarding your question '{question}', I would analyze the visual relationship between the left and right (or top and bottom) parts of the split image."
 
     try:
-        # Prepare the request
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": "Bearer token-abc123"
-        }
+        headers = {"Content-Type": "application/json"}
 
         data = {
-            "model": "HuggingFaceTB/SmolVLM2-1.7B-Instruct",
+            "model": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
             "messages": [
                 {
                     "role": "user",
@@ -221,16 +266,14 @@ def query_vllm(image1_b64: str, image2_b64: str, question: str) -> str:
                         }
                     ]
                 }
-            ],
-            "max_tokens": 500,
-            "temperature": 0.7
+            ]
         }
 
         response = requests.post(
             "http://localhost:8001/v1/chat/completions",
             headers=headers,
             json=data,
-            timeout=30
+            timeout=120
         )
 
         if response.status_code == 200:

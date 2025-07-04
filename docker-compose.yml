@@ -7,15 +7,15 @@ services:
       - backend
     environment:
       - REACT_APP_API_URL=http://localhost:8000
-
   backend:
     build: ./backend
     ports:
       - "8000:8000"
+      - "8001:8001"
     volumes:
       - ./backend:/app
     environment:
-      - VLLM_HOST=localhost
+      - VLLM_HOST=0.0.0.0
       - VLLM_PORT=8001
-      - MODEL_NAME=HuggingFaceTB/SmolVLM-Instruct
+      - MODEL_NAME=HuggingFaceTB/SmolVLM-256M-Base
     network_mode: "host"
